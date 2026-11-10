@@ -1,0 +1,226 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Tensegrity Trajectory Toolkit</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:18px;color:#222}
+    textarea{width:100%;height:120px;font-family:monospace}
+    .row{display:flex;gap:8px;margin-top:8px}
+    .panel{border:1px solid #ddd;padding:10px;border-radius:6px}
+    button{padding:6px 10px}
+    #viewer{height:220px;border:1px dashed #bbb;margin-top:8px;display:flex;align-items:center;justify-content:center}
+    table{border-collapse:collapse;width:100%}
+    td,th{border:1px solid #eee;padding:6px;font-size:12px}
+  </style>
+</head>
+<body>
+  <h3>Tensegrity Trajectory Toolkit — prototype</h3>
+  <div class="panel">
+    <label>Paste CSV/JSON content here or choose a file: </label>
+    <input id="file" type="file">
+    <textarea id="data" placeholder="Paste CSV or JSON here"></textarea>
+    <div class="row">
+      <button id="parse">Parse & Normalize</button>
+      <button id="auto">Load Example</button>
+    </div>
+  </div>
+
+  <div class="panel" id="controlsPanel" style="display:none;margin-top:10px">
+    <div class="row">
+      <button id="prev">◀ Step</button>
+      <button id="play">Play</button>
+      <button id="next">Step ▶</button>
+      <span id="frameInfo"></span>
+      <button id="exportCsv">Export CSV</button>
+      <button id="exportJson">Export JSON</button>
+    </div>
+    <div id="viewer">Frame preview will appear here.</div>
+    <div style="margin-top:10px"><strong>Normalized format (first frame):</strong>
+      <pre id="sample" style="background:#f7f7f7;padding:8px;border-radius:4px;max-height:180px;overflow:auto"></pre>
+    </div>
+  </div>
+
+<script>
+// Lightweight parser + normalizer
+function parseCSV(text){
+  const lines = text.trim().split(/\r?\n/).filter(l=>l.trim());
+  const rows = lines.map(l=>{
+    // naive CSV split (no quoted commas)
+    return l.split(/,|;|\t/).map(c=>c.trim());
+  });
+  const header = rows[0];
+  const data = rows.slice(1);
+  return {header, data};
+}
+
+function attemptNormalizeFromCSV(obj){
+  const header = obj.header.map(h=>h.toLowerCase());
+  // Heuristics: columns that contain module fields like module1_x or m1_x or id,x,y,z,qx,qy,qz,qw per module
+  const rows = obj.data.map(r=>r.map(v=>v==='""'? '': v));
+  // If header contains time or frame, keep it
+  const timeIdx = header.findIndex(h=>/time|t|frame/.test(h));
+
+  // Try per-row-per-module: columns: id,x,y,z,qx,qy,qz,qw (plus time)
+  const core = ['id','x','y','z','qx','qy','qz','qw'];
+  const coreIdx = core.map(k=>header.findIndex(h=>h===k));
+  if(coreIdx.every(i=>i>=0)){
+    // parse each row as one module per frame -> but we need frames grouping. Look for frame column
+    const frameIdx = header.findIndex(h=>/frame|time|t/.test(h));
+    const frames = {};
+    rows.forEach(r=>{
+      const frameKey = frameIdx>=0? r[frameIdx] : '0';
+      frames[frameKey] = frames[frameKey] || [];
+      const item = {id: r[coreIdx[0]]};
+      ['x','y','z','qx','qy','qz','qw'].forEach((k,i)=> item[k]=parseFloat(r[coreIdx[i+1]])||0);
+      frames[frameKey].push(item);
+    });
+    const sorted = Object.keys(frames).sort((a,b)=>parseFloat(a)-parseFloat(b));
+    return sorted.map(k=>({time: parseFloat(k)||0, modules: frames[k]}));
+  }
+
+  // Try per-module columns: module0_x, module0_y, ... module1_x, ...
+  // Find patterns like m0_x or mod0_x or module0_x
+  const colMap = {};
+  header.forEach((h,idx)=>{
+    const m = h.match(/(m|mod|module)?(\d+)_?(id)?_?(x|y|z|qx|qy|qz|qw)?/);
+    if(m){
+      const mid = m[2];
+      const key = (m[4]||m[3]||'id');
+      colMap[mid] = colMap[mid]||{};
+      colMap[mid][key] = idx;
+    }
+    const parts = h.split(/[_\-\.]/);
+    // fallback: patterns like id_0, x_0
+    if(parts.length===2 && /\d+/.test(parts[1])){
+      const mid = parts[1]; const key = parts[0]; colMap[mid]=colMap[mid]||{}; colMap[mid][key]=idx;
+    }
+  });
+  if(Object.keys(colMap).length>0){
+    const mids = Object.keys(colMap).sort((a,b)=>parseInt(a)-parseInt(b));
+    const frames = rows.map(r=>{
+      const modules = mids.map(mid=>{
+        const mcols = colMap[mid];
+        const id = mcols.id!==undefined? (r[mcols.id]||mid) : mid;
+        return {
+          id: id.toString(),
+          x: parseFloat(r[mcols.x]||0)||0,
+          y: parseFloat(r[mcols.y]||0)||0,
+          z: parseFloat(r[mcols.z]||0)||0,
+          qx: parseFloat(r[mcols.qx]||0)||0,
+          qy: parseFloat(r[mcols.qy]||0)||0,
+          qz: parseFloat(r[mcols.qz]||0)||0,
+          qw: parseFloat(r[mcols.qw]||1)||1
+        };
+      });
+      return {time:0, modules};
+    });
+    return frames;
+  }
+  return null;
+}
+
+function normalizeInput(text){
+  text = text.trim();
+  if(!text) return null;
+  // Try JSON
+  if(text[0]==='{'||text[0]==='['){
+    try{
+      const j = JSON.parse(text);
+      // Accept formats: array of frames {time, modules:[{id,x,y,z,qx,qy,qz,qw}]}
+      if(Array.isArray(j) && j.length && j[0].modules){
+        return j.map(f=>({time: f.time||0, modules: f.modules.map(m=>({id:String(m.id||m.name||m.module||''), x:+m.x||0,y:+m.y||0,z:+m.z||0,qx:+m.qx||0,qy:+m.qy||0,qz:+m.qz||0,qw:('qw' in m? +m.qw: 1)}))}));
+      }
+      // Try CSV in string fields
+    }catch(e){/* not json */}
+  }
+  // Try CSV heuristics
+  try{
+    const parsed = parseCSV(text);
+    const frames = attemptNormalizeFromCSV(parsed);
+    if(frames) return frames;
+  }catch(e){/* ignore */}
+  return null;
+}
+
+// UI
+let frames = [];
+let cur = 0;
+let playing = null;
+
+function renderFrame(i){
+  const v = document.getElementById('viewer');
+  if(!frames.length){ v.textContent='no data'; return; }
+  i = Math.max(0, Math.min(frames.length-1, i)); cur = i;
+  const frame = frames[i];
+  v.innerHTML = '<div style="text-align:left">'+
+    '<div>Frame '+i+' — time: '+(frame.time||0)+'</div>'+
+    '<table><thead><tr><th>id</th><th>x</th><th>y</th><th>z</th><th>qx</th><th>qy</th><th>qz</th><th>qw</th></tr></thead><tbody>'+
+    frame.modules.map(m=>'<tr><td>'+m.id+'</td><td>'+m.x.toFixed(3)+'</td><td>'+m.y.toFixed(3)+'</td><td>'+m.z.toFixed(3)+'</td><td>'+m.qx.toFixed(3)+'</td><td>'+m.qy.toFixed(3)+'</td><td>'+m.qz.toFixed(3)+'</td><td>'+m.qw.toFixed(3)+'</td></tr>').join('')+
+    '</tbody></table></div>';
+  document.getElementById('frameInfo').textContent = (i+1)+' / '+frames.length;
+  document.getElementById('sample').textContent = JSON.stringify(frames[0], null, 2);
+}
+
+document.getElementById('parse').onclick = ()=>{
+  const text = document.getElementById('data').value;
+  const f = normalizeInput(text);
+  if(!f){ alert('Could not parse input with current heuristics. Try simpler CSV/JSON or the example.'); return; }
+  frames = f;
+  cur = 0;
+  document.getElementById('controlsPanel').style.display = 'block';
+  renderFrame(0);
+};
+
+document.getElementById('file').onchange = e=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  const r = new FileReader();
+  r.onload = ev=>{ document.getElementById('data').value = ev.target.result; };
+  r.readAsText(f);
+};
+
+document.getElementById('prev').onclick = ()=>{ renderFrame(cur-1); };
+document.getElementById('next').onclick = ()=>{ renderFrame(cur+1); };
+
+document.getElementById('play').onclick = ()=>{
+  if(playing){ clearInterval(playing); playing=null; document.getElementById('play').textContent='Play'; return; }
+  playing = setInterval(()=>{ renderFrame((cur+1)%frames.length); }, 300);
+  document.getElementById('play').textContent='Stop';
+};
+
+function exportCSV(){
+  // flat CSV: frame, module_id, x,y,z,qx,qy,qz,qw
+  const lines = ['frame,module_id,x,y,z,qx,qy,qz,qw'];
+  frames.forEach((f,fi)=>{
+    f.modules.forEach(m=>{
+      lines.push([fi, m.id, m.x, m.y, m.z, m.qx, m.qy, m.qz, m.qw].join(','));
+    });
+  });
+  return lines.join('\n');
+}
+function exportJSON(){ return JSON.stringify(frames); }
+
+document.getElementById('exportCsv').onclick = ()=>{
+  if(!frames.length) return alert('No data');
+  const blob = new Blob([exportCSV()], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download='normalized.csv'; a.click();
+};
+
+document.getElementById('exportJson').onclick = ()=>{
+  if(!frames.length) return alert('No data');
+  const blob = new Blob([exportJSON()], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download='normalized.json'; a.click();
+};
+
+// Example loader
+document.getElementById('auto').onclick = ()=>{
+  // simple CSV example: module columns m0_x,m0_y,... m1_x...
+  document.getElementById('data').value = 'm0_x,m0_y,m0_z,m0_qx,m0_qy,m0_qz,m0_qw,m1_x,m1_y,m1_z,m1_qx,m1_qy,m1_qz,m1_qw\n0,0,0,0,0,0,1, 1,0,0,0,0,0,1\n0.1,0,0,0,0,0,1, 1.1,0,0,0,0,0,1';
+};
+
+</script>
+</body>
+</html>
